@@ -15,6 +15,7 @@
 #include <mq/Plugin.h>
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <queue>
@@ -35,6 +36,7 @@ using json = nlohmann::json;
 
 static constexpr int k_defaultPort = 8284;
 static int s_port = k_defaultPort;
+static std::chrono::steady_clock::time_point s_startTime;
 
 //============================================================================
 // Thread-safe command queue — written by HTTP thread, drained on game pulse
@@ -96,6 +98,7 @@ struct GameSnapshot
 
 	// Player
 	std::string playerName;
+	std::string playerClass;
 	int         playerLevel   = 0;
 	int         playerClassId = 0;
 	float       playerX = 0, playerY = 0, playerZ = 0;
@@ -208,6 +211,8 @@ static void UpdateSnapshot()
 	snap.playerName    = pLocalPlayer->Name;
 	snap.playerLevel   = pLocalPlayer->Level;
 	snap.playerClassId = static_cast<int>(pLocalPlayer->GetClass());
+	if (const char* cls = pLocalPlayer->GetClassString())
+		snap.playerClass = cls;
 	snap.playerX       = pLocalPlayer->X;
 	snap.playerY       = pLocalPlayer->Y;
 	snap.playerZ       = pLocalPlayer->Z;
@@ -338,11 +343,16 @@ static void UpdateSnapshot()
 			{
 				int64_t hp  = pSpawn->HPCurrent, hpMax = pSpawn->HPMax;
 				gm.hpPct   = hpMax > 0 ? static_cast<int>(hp * 100 / hpMax) : 0;
-				int mana    = 0, manaMax = 0;
+				int mana = 0, manaMax = 0;
 				if (pMem->pPlayer == pLocalPlayer)
 				{
 					mana    = GetCurMana();
 					manaMax = GetMaxMana();
+				}
+				else
+				{
+					mana    = pSpawn->GetCurrentMana();
+					manaMax = pSpawn->GetMaxMana();
 				}
 				gm.manaPct = manaMax > 0 ? mana * 100 / manaMax : 0;
 			}
@@ -488,22 +498,21 @@ static json BuildStateJson(const GameSnapshot& s)
 	if (!s.inGame)
 		return {{"inGame", false}};
 
-	int hpPct = s.hpMax > 0 ? static_cast<int>(s.hp * 100 / s.hpMax) : 0;
-	int mnPct = s.manaMax > 0 ? s.mana * 100 / s.manaMax : 0;
+	int hpPct  = s.hpMax  > 0 ? static_cast<int>(s.hp  * 100 / s.hpMax)  : 0;
+	int mnPct  = s.manaMax > 0 ? s.mana * 100 / s.manaMax : 0;
+	int endPct = s.enduranceMax > 0 ? s.endurance * 100 / s.enduranceMax : 0;
 
 	// Extended targets (confirmed aggressors in XTarget window)
 	json xtargets = json::array();
 	for (const GameSnapshot::XTargetEntry& xt : s.xTargets)
 		xtargets.push_back({{"name", xt.name}, {"level", xt.level}, {"distance", xt.distance}});
 
-	// Recent chat (last 10 lines)
+	// Recent chat (all buffered lines, up to k_chatBufferSize)
 	json chat = json::array();
 	{
 		std::lock_guard chatLock(s_chatMutex);
-		int start = static_cast<int>(s_chatLines.size()) - 10;
-		if (start < 0) start = 0;
-		for (int i = start; i < static_cast<int>(s_chatLines.size()); ++i)
-			chat.push_back(s_chatLines[i]);
+		for (const std::string& line : s_chatLines)
+			chat.push_back(line);
 	}
 
 	// Memorized spells + recast readiness
@@ -527,8 +536,12 @@ static json BuildStateJson(const GameSnapshot& s)
 
 	json state = {
 		{"inGame",         true},
+		{"name",           s.playerName},
+		{"level",          s.playerLevel},
+		{"class",          s.playerClass},
 		{"hp_pct",         hpPct},
 		{"mana_pct",       mnPct},
+		{"endurance_pct",  endPct},
 		{"moving",         s.isMoving},
 		{"invisible",      s.isInvisible},
 		{"position",       {{"x", s.playerX}, {"y", s.playerY}, {"z", s.playerZ}}},
@@ -724,7 +737,7 @@ static json HandleMCP(const json& req)
 		return MakeOk(id, {{"tools", {
 			{
 				{"name",        "get_state"},
-				{"description", "Get current game state: HP%, mana%, movement, zone, target, and nearby NPCs. Call this after any action to check the result."},
+				{"description", "Get current game state: name, level, class, HP%, mana%, endurance%, movement, zone, target, buffs, spells, loot, and recent chat. Call this after any action to check the result."},
 				{"inputSchema", {{"type","object"},{"properties",json::object()}}}
 			},
 			{
@@ -932,6 +945,60 @@ static void SetupRoutes()
 }
 
 //============================================================================
+// /mcp command — display server status
+//============================================================================
+
+static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* /*szLine*/)
+{
+	// Uptime
+	auto elapsed = std::chrono::steady_clock::now() - s_startTime;
+	int totalSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+	int hours    = totalSec / 3600;
+	int minutes  = (totalSec % 3600) / 60;
+	int secs     = totalSec % 60;
+
+	// Queue depth
+	int queueDepth = 0;
+	{
+		std::lock_guard lock(s_queueMutex);
+		queueDepth = static_cast<int>(s_commandQueue.size());
+	}
+
+	// Chat buffer depth
+	int chatDepth = 0;
+	{
+		std::lock_guard lock(s_chatMutex);
+		chatDepth = static_cast<int>(s_chatLines.size());
+	}
+
+	// Game state summary
+	bool inGame = false;
+	std::string charInfo;
+	{
+		std::lock_guard lock(s_snapshotMutex);
+		inGame = s_snapshot.inGame;
+		if (inGame)
+		{
+			int hpPct = s_snapshot.hpMax > 0
+				? static_cast<int>(s_snapshot.hp * 100 / s_snapshot.hpMax) : 0;
+			int mnPct = s_snapshot.manaMax > 0
+				? s_snapshot.mana * 100 / s_snapshot.manaMax : 0;
+			charInfo = fmt::format("{} ({}), zone: {}, HP: {}%, mana: {}%",
+				s_snapshot.playerName, s_snapshot.playerLevel,
+				s_snapshot.zoneShortName, hpPct, mnPct);
+		}
+	}
+
+	WriteChatf("\ag[MQMCPServer]\ax ─────────────────────────────────");
+	WriteChatf("\ag[MQMCPServer]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax", s_port);
+	WriteChatf("\ag[MQMCPServer]\ax  Uptime : \aw%02d:%02d:%02d\ax", hours, minutes, secs);
+	WriteChatf("\ag[MQMCPServer]\ax  Game   : %s", inGame ? fmt::format("\aw{}\ax", charInfo).c_str() : "\arNot in game\ax");
+	WriteChatf("\ag[MQMCPServer]\ax  Queue  : \aw%d\ax pending command(s)", queueDepth);
+	WriteChatf("\ag[MQMCPServer]\ax  Chat   : \aw%d\ax / %d lines buffered", chatDepth, (int)k_chatBufferSize);
+	WriteChatf("\ag[MQMCPServer]\ax ─────────────────────────────────");
+}
+
+//============================================================================
 // Plugin callbacks
 //============================================================================
 
@@ -953,6 +1020,8 @@ PLUGIN_API BOOL OnIncomingChat(const char* Line, DWORD Color)
 
 PLUGIN_API void InitializePlugin()
 {
+	s_startTime = std::chrono::steady_clock::now();
+
 	s_server = std::make_unique<httplib::Server>();
 	SetupRoutes();
 
@@ -960,11 +1029,15 @@ PLUGIN_API void InitializePlugin()
 		s_server->listen("127.0.0.1", s_port);
 	});
 
-	WriteChatf("\ag[MQMCPServer]\ax MCP server listening on \ahttp://127.0.0.1:%d/mcp\ax", s_port);
+	AddCommand("/mcp", Cmd_MCPStatus);
+
+	WriteChatf("\ag[MQMCPServer]\ax MCP server listening on \ayhttp://127.0.0.1:%d/mcp\ax — type \aw/mcp\ax for status", s_port);
 }
 
 PLUGIN_API void ShutdownPlugin()
 {
+	RemoveCommand("/mcp");
+
 	if (s_server)
 		s_server->stop();
 	if (s_serverThread.joinable())
