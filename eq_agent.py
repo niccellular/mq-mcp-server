@@ -23,6 +23,8 @@ from pathlib import Path
 import anthropic
 import httpx
 
+from class_knowledge import get_class_context
+
 # ── Config ──────────────────────────────────────────────────────────────────
 MCP_URL            = "http://127.0.0.1:8284"
 MODEL              = "claude-sonnet-4-6"   # swap to opus for better reasoning
@@ -33,77 +35,206 @@ MAX_HISTORY_PAIRS  = 20    # max user/assistant pairs to keep in history
 NUDGE_EVERY        = 8     # inject a state nudge every N seconds when Claude stops
 LOG_DIR            = Path("logs")
 
-SYSTEM_PROMPT = """
-You are controlling an EverQuest character via MacroQuest. Act decisively.
-After every action, a current state snapshot is returned — read it before deciding next.
+BASE_SYSTEM_PROMPT = """
+You are an autonomous agent controlling an EverQuest character via MacroQuest (MQ). You have
+four tools available. Read the state after every action and act decisively toward your goal.
 
-## State fields
-- hp_pct / mana_pct: health/mana as 0-100 integers
-- invisible: true if HideMode is active (drops on attack or most spells)
-- moving: true if position changed since last snapshot
-- position: {x, y, z} world coordinates
-- zone: current zone short name
-- aggro_count: number of NPCs in XTarget window
-- group_size: total group members including self
-- aggressors: [{name, level, distance}] NPCs currently hostile to you
-- target: {name, type, distance, hp_pct, buffs} current target
-- mem_spells: [{gem, id, name, ready, ms_remaining}] memorized gems (0-indexed); ms_remaining=0 means ready
-- active_buffs: [{id, name, duration, song}] self buffs; duration in ticks (1 tick ~6s); -1=permanent, -4=song/disc
-- loot_available: [{name, noDrop, personal}] items in AdvLoot window
-- recent_chat: last 100 lines of game chat (combat hits, spell results, XP, say, group, etc.)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## TOOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## Combat
-- Engage if aggro_count <= 3. Flee if aggro_count > 5: /travelto <safe_zone>
-- To attack: /target <name>, /attack on
-- Cast spells by gem number (1-indexed): /cast 1, /cast 2, etc.
-  - mem_spells gem field is 0-indexed; add 1 for /cast command (gem 0 → /cast 1)
-  - Check ms_remaining before casting — do not cast if ms_remaining > 0
-- Stop attacking if hp_pct < 30 — heal or run first
-- Sit to meditate when mana_pct < 20: /sit on (stand when ready: /sit off)
+### get_state
+Returns a full JSON snapshot of the current game state.
+- No parameters.
+- Use after every action to observe the result before deciding the next step.
+- Also use when idle to check for loot, aggro, or status changes.
+- Returns: inGame, name, level, class, hp_pct, mana_pct, endurance_pct, moving, invisible,
+  position, zone, aggro_count, aggressors, target, mem_spells, abilities, active_buffs,
+  quests, loot_available, recent_chat.
 
-## Combat abilities / disciplines
-- abilities: [{index, disc_cmd_index, name, id, ready, secs_remaining}] — known discs/combat abilities
-  - Use /disc <disc_cmd_index> to activate (disc_cmd_index is 1-based)
-  - secs_remaining is in SECONDS (not ms); 0 = ready
-  - Never use /disc if secs_remaining > 0
-  - Check ready=true before using any disc or combat ability
+### execute_command
+Queues any MacroQuest or EverQuest slash command to run on the next game pulse.
+- Parameter: command (string) — the full command including the leading slash.
+- Commands execute in order on the next EQ pulse (~100ms). The inline state returned with
+  the response is captured BEFORE the command runs — always call get_state afterward to
+  observe the result.
+- Use this for everything not covered by the other tools.
 
-## Buffs and cooldown tracking
-- Check active_buffs each tick to know what is currently active and how many ticks remain
-- Re-cast a buff before it expires (duration <= 1 tick remaining)
-- Check ms_remaining on mem_spells to know if a spell gem is ready — never cast a gem that is recharging
-- Songs (song=true in active_buffs) need re-casting every 1-2 ticks to maintain
+Common commands:
+  /target <name>              — target a nearby NPC or player by name
+  /attack on|off              — start or stop auto-attack
+  /sit on|off                 — sit to meditate (mana regen) or stand
+  /cast <gem>                 — cast memorized spell in gem slot (1-indexed)
+  /disc <n>                   — activate combat ability/discipline by disc_cmd_index
+  /doability <n>              — use a skill by its ability window slot number
+  /advloot personal <n> loot  — loot personal item at index n from AdvLoot window
+  /advloot shared <n> an      — take shared item at index n from AdvLoot window
+  /travelto <zoneshortname>   — zone travel (requires MQ2EasyFind or similar)
+  /nav stop                   — stop MQ2Nav navigation
+  /assist                     — target the main assist's target
+  /say <text>                 — say something in local chat (use sparingly)
+  /gsay <text>                — say something to the group
+  /mem <gem> <spellname>      — memorize a spell into a gem slot (1-indexed)
+  /stand                      — stand up (same as /sit off)
 
-## Looting
-- When loot_available is non-empty, loot each item by index (1-based):
-  - Personal loot: /advloot personal <index> loot
-  - Shared loot: /advloot shared <index> an
-- Loot index 1 first, then call get_state to see if more remain; repeat until loot_available is empty
-- Do NOT use /executeadvloot lootall — it does not exist
+### navigate_to
+Navigates to world coordinates using MQ2Nav. Requires MQ2Nav plugin to be loaded.
+- Parameters: y (North/South), x (East/West), z (Up/Down, optional).
+- The character will begin pathfinding. Check moving=true in get_state to confirm it started.
+- Navigation completes when moving=false and position matches destination.
+- If navigation is stuck (moving=false but not at destination), call execute_command /nav stop
+  and try again or path to an intermediate point.
+- For zone travel use execute_command /travelto <zone> instead.
 
-## Navigation
-- Within zone: navigate_to tool (requires MQ2Nav loaded)
-- Zone travel: /travelto <shortname>
+### say
+Says text in local /say chat, visible to nearby players.
+- Parameter: text (string).
+- Use sparingly — only for NPC interactions, hailing quest givers, or when explicitly instructed.
+- Do NOT use for status updates or commentary — those go in your text response only.
 
-## Spells
-- mem_spells lists what is memorized. Use recent_chat to confirm results (fizzle, resist, success)
-- After casting: wait for ms_remaining to reach 0 before casting that gem again
-- A fizzle wastes the cast — check recent_chat for "fizzle" before retrying
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## STATE FIELDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## Goal stack
-- You will be given a list of goals in priority order
-- Work through them in sequence; move to the next when the current one is complete
-- Always report which goal you are currently working on
+  inGame          — false if in character select or loading screen
+  name/level/class— character identity
+  hp_pct          — health 0–100. Below 20% is critical — act immediately.
+  mana_pct        — mana 0–100. Sit to med when below 20% (casters only).
+  endurance_pct   — endurance 0–100. Used by discs and melee abilities.
+  moving          — true if position changed since last snapshot
+  invisible       — true if HideMode active; breaks on attack or most spells
+  position        — {x, y, z} world coordinates
+  zone            — current zone short name
+  aggro_count     — number of NPCs actively targeting you (XTarget window)
+  aggressors      — [{name, level, distance}] NPCs currently hostile to you
+  group_size      — total group members including self
 
-## Key rules
-1. Always read recent_chat after every action — it contains hits, misses, fizzles, resists, deaths, XP
-2. One action per tick — queue the command, then call get_state to observe the result
-3. Never repeat a command that recent_chat shows is failing — diagnose why first
-4. If idle with no target, scan aggressors or find a nearby NPC to engage
-5. Never cast a spell gem with ms_remaining > 0 — it will fail silently
-6. Never use /executeadvloot — use /advloot personal <index> loot instead
-7. Never use /disc if secs_remaining > 0 — check abilities[].ready first
+  target          — current target:
+                    {name, type, distance, hp_pct, buffs:[{name,id}]}
+                    type is "PC", "NPC", or "Corpse"
+
+  mem_spells      — memorized spell gems:
+                    [{gem, id, name, ready, ms_remaining}]
+                    gem is 0-indexed; add 1 for /cast command (gem 0 → /cast 1)
+                    ms_remaining: milliseconds until ready; 0 = ready now
+                    NEVER cast a gem with ms_remaining > 0
+
+  abilities       — combat abilities and disciplines:
+                    [{index, disc_cmd_index, name, id, ready, secs_remaining}]
+                    Use /disc <disc_cmd_index> to activate (disc_cmd_index is 1-based)
+                    secs_remaining is SECONDS (not ms); 0 = ready
+                    NEVER use /disc if secs_remaining > 0
+
+  active_buffs    — buffs and songs currently on self:
+                    [{id, name, duration, song}]
+                    duration in ticks (1 tick ≈ 6 seconds)
+                    -1 = permanent; song=true means it needs re-casting every 1–2 ticks
+
+  quests          — active quests with only the currently active objectives shown:
+                    [{title, system, objectives:[{description, type, current, required}]}]
+                    type: Kill / Deliver / Loot / Hail / Explore / Tradeskill / etc.
+                    Use this to know what to kill, where to go, and when a quest step is done.
+
+  loot_available  — items in the AdvLoot window:
+                    [{name, noDrop, personal}]
+                    personal=true → /advloot personal <index> loot
+                    personal=false → /advloot shared <index> an
+                    Index is 1-based. Always loot index 1 first, then re-check state.
+
+  recent_chat     — last 100 lines of game chat. Read this after EVERY action.
+                    Contains: melee hits, spell results, fizzles, resists, XP gains,
+                    death messages, NPC dialogue, system messages.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## COMBAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Engage when aggro_count <= 3 and hp_pct > 50.
+- Flee when aggro_count > 5 or hp_pct < 20: /travelto <safe_zone>
+- Attack sequence: /target <name> → /attack on
+- Stop auto-attack before casting: /attack off (if your class requires it)
+- hp_pct < 30: stop attacking, heal or run — do not continue fighting
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## SPELLS (caster classes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Cast by gem slot: /cast <n> where n = gem + 1 (gem 0 → /cast 1)
+- Check ms_remaining = 0 before casting. A recharging gem silently does nothing.
+- After casting, check recent_chat for: "You begin casting", "fizzle", "resist", spell effect
+- Fizzle = wasted cast, try again. Resist = target immune or high resist, try a different spell.
+- Sit to meditate when mana_pct < 20: /sit on. Stand when mana_pct > 80: /sit off
+- Songs (song=true in active_buffs): must be re-cast every 1–2 ticks to remain active
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## DISCIPLINES & DOABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two different command types for melee abilities — do not confuse them:
+
+/disc <disc_cmd_index>
+  - For combat abilities shown in the abilities[] state field
+  - disc_cmd_index is given directly in the state — use that exact number
+  - Check ready=true and secs_remaining=0 before using
+
+/doability <n>
+  - For passive skills in the combat skills window (kicks, strikes, Mend, etc.)
+  - These do NOT appear in abilities[] — they are always available if the skill is trained
+  - Slot numbers vary by character; test with /doability 1 through 8 and check recent_chat
+    to discover which slot is which skill
+  - Common monk doability skills: Flying Kick, Round Kick, Dragon Punch, Eagle Strike, Mend
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## LOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- When loot_available is non-empty, loot before moving on
+- /advloot personal <index> loot   ← personal items
+- /advloot shared <index> an       ← shared items
+- Always start at index 1, call get_state after each loot to get the updated list
+- NEVER use /executeadvloot — it does not exist
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## QUESTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Check quests[] in state to know your active objectives
+- Kill quests: target mobs whose name matches the objective description; track current vs required
+- Hail quests: /target <NPC name>, then use say tool or /say <trigger phrase>
+- Deliver quests: /target <NPC name>, then /give (item must be in inventory)
+- Explore quests: navigate_to the described location; objective updates on arrival
+- A quest step completes when current == required in the objective; move to next step
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## GOAL STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- You will be given goals in priority order (semicolon-separated)
+- Work top to bottom; a goal is complete when its condition is satisfied
+- Always state which goal you are currently working on at the start of each response
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## CORE RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Read recent_chat after EVERY action — it is the ground truth for what happened
+2. One action per response — use one tool call, then observe before acting again
+3. Never repeat a failing command — if recent_chat shows it failed, diagnose why first
+4. If idle with no target and aggro_count=0, find a mob matching your current goal
+5. Never cast a spell gem with ms_remaining > 0 — it silently does nothing
+6. Never use /disc if secs_remaining > 0 — check abilities[].ready first
+7. Never use /executeadvloot — use /advloot personal/shared instead
+8. After Feign Death: watch recent_chat for mobs losing interest before standing
+9. If a command has no effect after 2 attempts, try a different approach entirely
 """.strip()
+
+
+def build_system_prompt(class_name: str) -> str:
+    """Append class-specific knowledge to the base system prompt."""
+    class_section = get_class_context(class_name)
+    if class_section.startswith("[Unknown"):
+        return BASE_SYSTEM_PROMPT
+    return f"{BASE_SYSTEM_PROMPT}\n\n{class_section}"
 
 TOOLS = [
     {
@@ -286,6 +417,22 @@ def run(goal_str: str):
     # Seed with initial state and goal stack
     initial_state = get_current_state()
     log("Initial state received.")
+
+    # Build class-aware system prompt
+    try:
+        state_data = json.loads(initial_state)
+        char_class = state_data.get("class", "")
+        char_level = state_data.get("level", "")
+    except (json.JSONDecodeError, AttributeError):
+        char_class = ""
+        char_level = ""
+
+    system_prompt = build_system_prompt(char_class)
+    if char_class:
+        log(f"Class detected: {char_class} {char_level} — injecting class knowledge.")
+    else:
+        log("No class detected — using base system prompt.")
+
     messages.append({
         "role": "user",
         "content": (
@@ -301,7 +448,7 @@ def run(goal_str: str):
                 response = client.messages.create(
                     model=MODEL,
                     max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     tools=TOOLS,
                     messages=messages
                 )

@@ -264,38 +264,54 @@ CLASS_KNOWLEDGE = {
 
     # ─────────────────────────────────────────────────────────────────────────
     "Monk": {
-        "role": "Pure melee DPS + FD (Feign Death). Highest sustained melee DPS. No mana.",
+        "role": "Pure melee DPS + Feign Death puller. No mana. Highest sustained melee DPS. Level 66.",
         "combat_priority": [
-            "Disc: Hundred Hands Effect for attack speed",
-            "Disc: Ashenhand for undead fights",
-            "Flying Kick on cooldown",
-            "Tiger Claw / Dragon Punch on cooldown",
-            "FD to shed aggro if overaggro'd: /disc FeignDeath",
+            "1. /attack on immediately when target acquired",
+            "2. Check abilities[] — use any ready disc with disc_cmd_index",
+            "3. Flying Kick: /doability 1 (or whichever slot — check doability list)",
+            "4. Round Kick / Dragon Punch / Eagle Strike / Tiger Claw on cooldown via /doability",
+            "5. Disc: Heel of Kanji on cooldown for burst melee damage",
+            "6. Disc: Phantom Silk / Voiddancer when HP < 40% for dodge",
+            "7. Disc: Innerflame when fighting single mob and HP stable",
+            "8. Mend via /doability when HP < 50% — ~6min CD, use proactively",
+            "9. Feign Death if HP < 20% or aggro_count > 3: /disc <FD disc_cmd_index>",
         ],
         "spell_categories": {},
         "disciplines": {
-            "Hundred Hands Effect": "Max attack speed. Use on cooldown, ~8min CD.",
-            "Ashenhand": "Extra undead damage. Use at start of undead fights.",
-            "Inner Flame": "Self damage bonus. Use in sustained fights.",
-            "Mend": "Self-heal ~50% HP. Not a disc — it's a skill. Use on cooldown. /doability Mend",
-            "Feign Death": "Drop to ground, lose aggro. /disc or keybind. Essential escape.",
+            "Heel of Kanji": "Melee damage proc burst. Use on cooldown in every fight. ~3min CD.",
+            "Innerflame": "Sustained DPS disc. Use when fighting single mob and HP is stable. ~5min CD.",
+            "Phantom Silk": "Dodge/avoidance disc. Use when HP drops below 40% or adds come. ~10min CD.",
+            "Voiddancer": "Evasion + movement disc. Use when overwhelmed or need to reposition.",
+            "Ashenhand Discipline": "Extra undead damage modifier. Use at start of every undead fight.",
+            "Feign Death": "Drop to ground and shed all aggro. Use to pull singles or escape death. /disc <index>. Wait 3s then stand.",
+            "Stunning Kick": "Stuns target briefly. Use to interrupt NPC spellcasting.",
         },
         "aas": {
-            "Heel of Kanji": "Additional melee proc AA. Use on cooldown.",
-            "Steal Essence": "Lifetap-style AA. Use for HP sustain.",
-            "Flying Kick mastery": "Passive damage increase.",
+            "Steal Essence": "Lifetap melee proc — restores HP on hits. Passive when activated.",
+            "Flying Kick Mastery": "Passive: increases Flying Kick damage. Always active.",
+            "Technique of Master Wu": "Chance for extra attacks on Flying Kick. Passive.",
+            "Speed of the Knight": "Endurance regen boost. Passive.",
         },
         "innates": [
-            "Mend: /doability heals ~25% HP, ~6min CD. Use proactively.",
-            "Dual attack and triple attack at high levels",
-            "Resist disease/poison inherent bonus",
+            "Mend: self-heal via /doability — restores ~20-30% HP, ~6min CD. Use at < 60% HP proactively.",
+            "Feign Death is a discipline (check abilities[] for disc_cmd_index). After FD, wait 3s before standing.",
+            "Dual wield + double attack + triple attack proc at level 66.",
+            "Monks are the best pullers: FD to shed extras after tagging a group, return with single.",
+            "Weight matters: keep equipped weight low for max AC and attack speed.",
         ],
         "survival": [
-            "Mend (/doability) — use proactively not just emergencies",
-            "Feign Death to reset fight",
-            "Voiddancer disc if available for dodge",
+            "Mend (/doability) at 50% HP — don't wait for emergencies, 6min CD",
+            "Phantom Silk disc at 40% HP for damage reduction",
+            "Feign Death at 20% HP to fully reset: /disc <FD index> — wait 3s then stand and re-engage or run",
+            "If adds are up and FD is down: /nav away from spawn, zone out if needed",
         ],
-        "mana_endurance": "No mana. Endurance: sit between fights for fast recovery.",
+        "pulling": [
+            "Run to mob cluster, hit one to tag it",
+            "Immediately FD to drop aggro from all but one (the one running to check corpse)",
+            "Stand and lead the single back to camp",
+            "If more follow: FD again until clean",
+        ],
+        "mana_endurance": "No mana. Endurance recovers while standing — no need to sit unless fully depleted.",
     },
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -690,6 +706,11 @@ def get_class_context(class_name: str) -> str:
     if data.get("innates"):
         lines += ["", "**Innate/Passive Abilities:**"]
         for item in data["innates"]:
+            lines.append(f"  - {item}")
+
+    if data.get("pulling"):
+        lines += ["", "**Pulling Strategy:**"]
+        for item in data["pulling"]:
             lines.append(f"  - {item}")
 
     lines += ["", "**Survival Options (in order of preference):**"]
