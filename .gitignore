@@ -1,0 +1,15 @@
+build/
+out/
+.vs/
+*.user
+*.vcxproj.user
+CMakeUserPresets.json
+CMakeSettings.json
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+__pycache__/
+*.pyc
+.env
