@@ -8,9 +8,30 @@
  * Debug REST:    GET  http://localhost:8284/me|zone|target|spawns
  */
 
+// cpp-httplib requires a Windows 10 API level (CreateFile2, etc.), but MQ's
+// Common.props pins _WIN32_WINNT=0x0601 (Win7). Override it BEFORE any include
+// (windows.h must see 0x0A00 to declare the newer APIs). #undef first so there
+// is no macro-redefinition warning against the command-line define.
+#ifdef _WIN32_WINNT
+#undef _WIN32_WINNT
+#endif
+#define _WIN32_WINNT 0x0A00
+#ifdef WINVER
+#undef WINVER
+#endif
+#define WINVER 0x0A00
+
 // winsock2.h must be included before windows.h (which mq/Plugin.h pulls in)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+// Include cpp-httplib BEFORE mq/Plugin.h. Plugin.h's pch.h forces
+// _WIN32_WINNT=0x0601 and pulls in windows.h, which hides the Win10 APIs
+// (CreateFile2, CreateFileMappingFromApp, ...) that httplib needs. Including it
+// first processes its windows.h at 0x0A00 (set above); windows.h's include
+// guard then makes MQ's later include a no-op.
+#define CPPHTTPLIB_NO_EXCEPTIONS
+#include <httplib.h>
 
 #include <mq/Plugin.h>
 
@@ -25,9 +46,6 @@
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
-
-#define CPPHTTPLIB_NO_EXCEPTIONS
-#include <httplib.h>
 
 PreSetup("MQMCPServer");
 PLUGIN_VERSION(1.0);
@@ -55,7 +73,7 @@ static void EnqueueCommand(std::string cmd)
 // Chat ring buffer — fed by OnWriteChatColor, read by HTTP thread
 //============================================================================
 
-static constexpr size_t k_chatBufferSize = 100;
+static constexpr size_t k_chatBufferSize = 4000;
 static std::deque<std::string> s_chatLines;
 static std::mutex              s_chatMutex;
 
@@ -182,6 +200,9 @@ struct GameSnapshot
 
 static GameSnapshot s_snapshot;
 static std::mutex   s_snapshotMutex;
+// OFF during eqlib struct-layout fixes (snapshot reads PlayerClient/spawn fields that
+// may be at wrong offsets and crash). Server still serves execute_command + chat.
+static bool         s_snapshotEnabled = false;
 
 static const char* SpawnTypeName(int type)
 {
@@ -196,16 +217,22 @@ static const char* SpawnTypeName(int type)
 
 static void UpdateSnapshot()
 {
+	// The snapshot reads PlayerClient/spawn fields via the eqlib structs. During an
+	// eqlib struct-layout update those offsets can be wrong, making these reads crash.
+	// While the layout is being fixed, keep this OFF so the server still runs for
+	// execute_command + chat capture (which don't touch the structs). Toggle with
+	// /mcpsnapshot, or flip this default back to true once the structs are correct.
 	GameSnapshot snap;
+	// GetGameState()/pLocalPlayer-null are safe (not struct field reads), so always set
+	// inGame accurately — the command queue, chat reader and resources gate on it.
+	snap.inGame = (GetGameState() == GAMESTATE_INGAME && pLocalPlayer != nullptr);
 
-	if (GetGameState() != GAMESTATE_INGAME || !pLocalPlayer)
+	if (!s_snapshotEnabled || !snap.inGame)
 	{
 		std::lock_guard lock(s_snapshotMutex);
-		s_snapshot = snap;
+		s_snapshot = snap;   // inGame preserved; struct field reads skipped (avoids crash)
 		return;
 	}
-
-	snap.inGame = true;
 
 	// ---- Player ----
 	snap.playerName    = pLocalPlayer->Name;
@@ -838,7 +865,12 @@ static json HandleMCP(const json& req)
 //============================================================================
 
 static std::unique_ptr<httplib::Server> s_server;
-static std::thread                       s_serverThread;
+// Raw pointer (not a global std::thread) on purpose: a global std::thread has a
+// destructor that calls std::terminate() if still joinable. On an abnormal process
+// exit MQ may not call ShutdownPlugin, yet DLL_PROCESS_DETACH still runs the CRT
+// atexit destructors — a joinable global thread there => FAST_FAIL abort that masks
+// the real exit. A raw pointer has a trivial destructor, so teardown can never abort.
+static std::thread*                      s_serverThread = nullptr;
 
 static void AddCors(httplib::Response& res)
 {
@@ -1025,7 +1057,7 @@ PLUGIN_API void InitializePlugin()
 	s_server = std::make_unique<httplib::Server>();
 	SetupRoutes();
 
-	s_serverThread = std::thread([] {
+	s_serverThread = new std::thread([] {
 		s_server->listen("127.0.0.1", s_port);
 	});
 
@@ -1040,8 +1072,13 @@ PLUGIN_API void ShutdownPlugin()
 
 	if (s_server)
 		s_server->stop();
-	if (s_serverThread.joinable())
-		s_serverThread.join();
+	if (s_serverThread)
+	{
+		if (s_serverThread->joinable())
+			s_serverThread->join();
+		delete s_serverThread;
+		s_serverThread = nullptr;
+	}
 	s_server.reset();
 
 	WriteChatf("\ag[MQMCPServer]\ax Stopped.");
